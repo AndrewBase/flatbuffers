@@ -119,6 +119,87 @@ func CheckNoNamespaceImport(fail func(string, ...interface{})) {
 	}
 }
 
+func CheckFixedLengthArrays(fail func(string, ...interface{})) {
+	expectedStruct := example.ArrayStructT{
+		A: 12.34,
+		B: [0xF]int32{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
+		C: -127,
+		D: [2]example.NestedStructT{
+			{
+				A: [2]int32{-1, 2},
+				B: example.TestEnumA,
+				C: [2]example.TestEnum{example.TestEnumC, example.TestEnumB},
+				D: [2]int64{0x1122334455667788, -0x1122334455667788},
+			},
+			{
+				A: [2]int32{3, -4},
+				B: example.TestEnumB,
+				C: [2]example.TestEnum{example.TestEnumB, example.TestEnumA},
+				D: [2]int64{-0x1122334455667788, 0x1122334455667788},
+			},
+		},
+		E: 1,
+		F: [2]int64{5000, 6000},
+	}
+
+	builder := flatbuffers.NewBuilder(1024)
+	tableOffset := (&example.ArrayTableT{A: &expectedStruct}).Pack(builder)
+	example.FinishArrayTableBuffer(builder, tableOffset)
+
+	arrayTable := example.GetRootAsArrayTable(builder.FinishedBytes(), 0)
+	arrayStruct := arrayTable.A(nil)
+	if arrayStruct == nil {
+		fail("array table field a is nil")
+	}
+
+	if got := arrayStruct.BLength(); got != len(expectedStruct.B) {
+		fail(FailString("array struct b length", len(expectedStruct.B), got))
+	}
+	for i, want := range expectedStruct.B {
+		if got := arrayStruct.B(i); got != want {
+			fail(FailString(fmt.Sprintf("array struct b(%d)", i), want, got))
+		}
+	}
+
+	if got := arrayStruct.DLength(); got != len(expectedStruct.D) {
+		fail(FailString("array struct d length", len(expectedStruct.D), got))
+	}
+	nested0 := arrayStruct.D(nil, 0)
+	if nested0 == nil {
+		fail("array struct d(0) is nil")
+	}
+	if got := nested0.ALength(); got != len(expectedStruct.D[0].A) {
+		fail(FailString("nested struct a length", len(expectedStruct.D[0].A), got))
+	}
+	for i, want := range expectedStruct.D[0].A {
+		if got := nested0.A(i); got != want {
+			fail(FailString(fmt.Sprintf("nested struct a(%d)", i), want, got))
+		}
+	}
+
+	unpacked := arrayTable.UnPack()
+	if unpacked.A == nil {
+		fail("array table unpacked field a is nil")
+	}
+	if !reflect.DeepEqual(expectedStruct, *unpacked.A) {
+		fail(FailString("array table unpack", expectedStruct, *unpacked.A))
+	}
+
+	if ok := arrayStruct.MutateB(0, 99); !ok {
+		fail("array struct mutate b returned false")
+	}
+	if got := arrayStruct.B(0); got != 99 {
+		fail(FailString("array struct mutated b(0)", int32(99), got))
+	}
+
+	if ok := nested0.MutateA(1, -99); !ok {
+		fail("nested struct mutate a returned false")
+	}
+	if got := nested0.A(1); got != -99 {
+		fail(FailString("nested struct mutated a(1)", int32(-99), got))
+	}
+}
+
 // TestAll runs all checks, failing if any errors occur.
 func TestAll(t *testing.T) {
 	// Verify that the Go FlatBuffers runtime library generates the
@@ -198,6 +279,9 @@ func TestAll(t *testing.T) {
 
 	// Check a no namespace import
 	CheckNoNamespaceImport(t.Fatalf)
+
+	// Check fixed-size arrays in generated Go code.
+	CheckFixedLengthArrays(t.Fatalf)
 
 	// Check size-prefixed flatbuffers
 	CheckSizePrefixedBuffer(t.Fatalf)

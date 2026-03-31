@@ -2827,6 +2827,7 @@ bool Parser::SupportsAdvancedArrayFeatures() const {
           ~(IDLOptions::kCpp | IDLOptions::kPython | IDLOptions::kJava |
             IDLOptions::kCSharp | IDLOptions::kJsonSchema | IDLOptions::kJson |
             IDLOptions::kBinary | IDLOptions::kRust | IDLOptions::kTs |
+            IDLOptions::kGo |
             IDLOptions::kSwift)) == 0;
 }
 

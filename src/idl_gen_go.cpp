@@ -405,6 +405,17 @@ class GoGenerator : public BaseGenerator {
     code += "\treturn 0\n}\n\n";
   }
 
+  // Get the length of a fixed-size array.
+  void GetArrayLen(const StructDef& struct_def, const FieldDef& field,
+                   std::string* code_ptr) {
+    std::string& code = *code_ptr;
+
+    GenReceiver(struct_def, code_ptr);
+    code += " " + namer_.Function(field) + "Length() int {\n";
+    code += "\treturn " + NumToString(field.value.type.fixed_length) + "\n";
+    code += "}\n\n";
+  }
+
   // Get a [ubyte] vector as a byte slice.
   void GetUByteSlice(const StructDef& struct_def, const FieldDef& field,
                      std::string* code_ptr) {
@@ -603,6 +614,47 @@ class GoGenerator : public BaseGenerator {
     code += "}\n\n";
   }
 
+  // Get the value of a fixed array's struct member.
+  void GetMemberOfArrayOfStruct(const StructDef& struct_def,
+                                const FieldDef& field, std::string* code_ptr) {
+    std::string& code = *code_ptr;
+    auto arraytype = field.value.type.VectorType();
+    const std::string field_type = GenTypeGet(arraytype);
+
+    GenReceiver(struct_def, code_ptr);
+    code += " " + namer_.Function(field);
+    code += "(obj *" + field_type;
+    code += ", j int) *" + field_type + " {\n";
+    code += "\tif obj == nil {\n";
+    code += "\t\tobj = new(" + field_type + ")\n";
+    code += "\t}\n";
+    code += "\tobj.Init(rcv._tab.Bytes, rcv._tab.Pos+flatbuffers.UOffsetT(";
+    code += NumToString(field.value.offset) + ")+flatbuffers.UOffsetT(j*";
+    code += NumToString(InlineSize(arraytype)) + "))\n";
+    code += "\treturn obj\n";
+    code += "}\n\n";
+  }
+
+  // Get the value of a fixed array's non-struct member.
+  void GetMemberOfArrayOfNonStruct(const StructDef& struct_def,
+                                   const FieldDef& field,
+                                   std::string* code_ptr) {
+    std::string& code = *code_ptr;
+    auto arraytype = field.value.type.VectorType();
+
+    GenReceiver(struct_def, code_ptr);
+    code += " " + namer_.Function(field);
+    code += "(j int) " + GenTypeGet(arraytype) + " {\n";
+    code +=
+        "\treturn " +
+        CastToEnum(arraytype, GenGetter(field.value.type) +
+                                  "(rcv._tab.Pos + flatbuffers.UOffsetT(" +
+                                  NumToString(field.value.offset) +
+                                  ") + flatbuffers.UOffsetT(j*" +
+                                  NumToString(InlineSize(arraytype)) + "))");
+    code += "\n}\n\n";
+  }
+
   // Begin the creator function signature.
   void BeginBuilderArgs(const StructDef& struct_def, std::string* code_ptr) {
     std::string& code = *code_ptr;
@@ -615,25 +667,96 @@ class GoGenerator : public BaseGenerator {
     code += "(builder *flatbuffers.Builder";
   }
 
+  struct FieldPathSegment {
+    std::string name;
+    int length;
+  };
+
+  std::string Indent(size_t level) { return std::string(level, '\t'); }
+
+  std::string FieldPathName(const std::vector<FieldPathSegment>& path) {
+    std::string name;
+    for (size_t i = 0; i + 1 < path.size(); ++i) {
+      name += path[i].name + "_";
+    }
+    return name + namer_.Variable(path.back().name);
+  }
+
+  std::string FieldPathType(const std::vector<FieldPathSegment>& path,
+                            const Type& type) {
+    std::string result;
+    for (size_t i = 0; i < path.size(); ++i) {
+      if (path[i].length > 0) {
+        result += "[" + NumToString(path[i].length) + "]";
+      }
+    }
+    return result + GenTypeGet(type);
+  }
+
+  std::string FieldPathIndexedValue(
+      const std::vector<FieldPathSegment>& path,
+      const std::vector<std::string>& array_indices) {
+    std::string value = FieldPathName(path);
+    size_t array_index = 0;
+    for (size_t i = 0; i < path.size(); ++i) {
+      if (path[i].length > 0) {
+        value += "[" + array_indices[array_index++] + "]";
+      }
+    }
+    return value;
+  }
+
+  std::string NativeFieldPath(const std::string& root,
+                              const std::vector<FieldPathSegment>& path) {
+    std::string value = root;
+    for (size_t i = 0; i < path.size(); ++i) {
+      value += "." + namer_.Field(path[i].name);
+    }
+    return value;
+  }
+
+  std::string NativeFieldPathIndexedValue(
+      const std::string& root, const std::vector<FieldPathSegment>& path,
+      const std::vector<std::string>& array_indices) {
+    std::string value = root;
+    size_t array_index = 0;
+    for (size_t i = 0; i < path.size(); ++i) {
+      value += "." + namer_.Field(path[i].name);
+      if (path[i].length > 0) {
+        value += "[" + array_indices[array_index++] + "]";
+      }
+    }
+    return value;
+  }
+
+  bool FieldPathHasArrayPrefix(const std::vector<FieldPathSegment>& path) {
+    for (size_t i = 0; i + 1 < path.size(); ++i) {
+      if (path[i].length > 0) return true;
+    }
+    return false;
+  }
+
   // Recursively generate arguments for a constructor, to deal with nested
-  // structs.
-  void StructBuilderArgs(const StructDef& struct_def, const char* nameprefix,
+  // structs and fixed arrays.
+  void StructBuilderArgs(const StructDef& struct_def,
+                         std::vector<FieldPathSegment>* path,
                          std::string* code_ptr) {
     for (auto it = struct_def.fields.vec.begin();
          it != struct_def.fields.vec.end(); ++it) {
-      auto& field = **it;
-      if (IsStruct(field.value.type)) {
-        // Generate arguments for a struct inside a struct. To ensure names
-        // don't clash, and to make it obvious these arguments are constructing
-        // a nested struct, prefix the name with the field name.
-        StructBuilderArgs(*field.value.type.struct_def,
-                          (nameprefix + (field.name + "_")).c_str(), code_ptr);
+      const auto& field = **it;
+      const bool is_array = IsArray(field.value.type);
+      const auto& field_type =
+          is_array ? field.value.type.VectorType() : field.value.type;
+      path->push_back(
+          {field.name, is_array ? field.value.type.fixed_length : 0});
+      if (field_type.base_type == BASE_TYPE_STRUCT) {
+        StructBuilderArgs(*field_type.struct_def, path, code_ptr);
       } else {
         std::string& code = *code_ptr;
-        code += std::string(", ") + nameprefix;
-        code += namer_.Variable(field);
-        code += " " + TypeName(field);
+        code += ", " + FieldPathName(*path) + " " +
+                FieldPathType(*path, field_type);
       }
+      path->pop_back();
     }
   }
 
@@ -645,25 +768,54 @@ class GoGenerator : public BaseGenerator {
 
   // Recursively generate struct construction statements and instert manual
   // padding.
-  void StructBuilderBody(const StructDef& struct_def, const char* nameprefix,
+  void StructBuilderBody(const StructDef& struct_def,
+                         std::vector<FieldPathSegment>* path,
+                         std::vector<std::string>* array_indices,
                          std::string* code_ptr) {
     std::string& code = *code_ptr;
-    code += "\tbuilder.Prep(" + NumToString(struct_def.minalign) + ", ";
+    const auto indent = Indent(array_indices->size() + 1);
+    code += indent + "builder.Prep(" + NumToString(struct_def.minalign) + ", ";
     code += NumToString(struct_def.bytesize) + ")\n";
     for (auto it = struct_def.fields.vec.rbegin();
          it != struct_def.fields.vec.rend(); ++it) {
-      auto& field = **it;
-      if (field.padding)
-        code += "\tbuilder.Pad(" + NumToString(field.padding) + ")\n";
-      if (IsStruct(field.value.type)) {
-        StructBuilderBody(*field.value.type.struct_def,
-                          (nameprefix + (field.name + "_")).c_str(), code_ptr);
+      const auto& field = **it;
+      if (field.padding) {
+        code += indent + "builder.Pad(" + NumToString(field.padding) + ")\n";
+      }
+      const bool is_array = IsArray(field.value.type);
+      const auto& field_type =
+          is_array ? field.value.type.VectorType() : field.value.type;
+      path->push_back(
+          {field.name, is_array ? field.value.type.fixed_length : 0});
+      if (is_array) {
+        const auto loop_var = "idx" + NumToString(array_indices->size());
+        code += indent + "for " + loop_var +
+                " := " + NumToString(field.value.type.fixed_length) + " - 1; " +
+                loop_var + " >= 0; " + loop_var + "-- {\n";
+        array_indices->push_back(loop_var);
+        if (field_type.base_type == BASE_TYPE_STRUCT) {
+          StructBuilderBody(*field_type.struct_def, path, array_indices,
+                            code_ptr);
+        } else {
+          const auto loop_indent = Indent(array_indices->size() + 1);
+          code += loop_indent + "builder.Prepend" +
+                  namer_.Method(GenTypeBasic(field_type)) + "(";
+          code += CastToBaseType(field_type,
+                                 FieldPathIndexedValue(*path, *array_indices)) +
+                  ")\n";
+        }
+        array_indices->pop_back();
+        code += indent + "}\n";
+      } else if (field_type.base_type == BASE_TYPE_STRUCT) {
+        StructBuilderBody(*field_type.struct_def, path, array_indices,
+                          code_ptr);
       } else {
-        code += "\tbuilder.Prepend" + GenMethod(field) + "(";
+        code += indent + "builder.Prepend" + GenMethod(field) + "(";
         code += CastToBaseType(field.value.type,
-                               nameprefix + namer_.Variable(field)) +
+                               FieldPathIndexedValue(*path, *array_indices)) +
                 ")\n";
       }
+      path->pop_back();
     }
   }
 
@@ -772,6 +924,15 @@ class GoGenerator : public BaseGenerator {
         case BASE_TYPE_STRING:
           GetStringField(struct_def, field, code_ptr);
           break;
+        case BASE_TYPE_ARRAY: {
+          auto arraytype = field.value.type.VectorType();
+          if (arraytype.base_type == BASE_TYPE_STRUCT) {
+            GetMemberOfArrayOfStruct(struct_def, field, code_ptr);
+          } else {
+            GetMemberOfArrayOfNonStruct(struct_def, field, code_ptr);
+          }
+          break;
+        }
         case BASE_TYPE_VECTOR: {
           auto vectortype = field.value.type.VectorType();
           if (vectortype.base_type == BASE_TYPE_STRUCT) {
@@ -799,6 +960,8 @@ class GoGenerator : public BaseGenerator {
       if (field.value.type.element == BASE_TYPE_UCHAR) {
         GetUByteSlice(struct_def, field, code_ptr);
       }
+    } else if (IsArray(field.value.type)) {
+      GetArrayLen(struct_def, field, code_ptr);
     }
   }
 
@@ -853,6 +1016,24 @@ class GoGenerator : public BaseGenerator {
     code += "}\n\n";
   }
 
+  // Mutate an element of a fixed-size array of scalars.
+  void MutateElementOfArrayOfNonStruct(const StructDef& struct_def,
+                                       const FieldDef& field,
+                                       std::string* code_ptr) {
+    std::string& code = *code_ptr;
+    auto arraytype = field.value.type.VectorType();
+    std::string setter =
+        "rcv._tab.Mutate" + namer_.Method(GenTypeBasic(arraytype));
+    GenReceiver(struct_def, code_ptr);
+    code += " Mutate" + namer_.Function(field);
+    code += "(j int, n " + GenTypeGet(arraytype) + ") bool {\n\treturn ";
+    code += setter + "(rcv._tab.Pos+flatbuffers.UOffsetT(";
+    code += NumToString(field.value.offset) + ")+flatbuffers.UOffsetT(j*";
+    code += NumToString(InlineSize(arraytype)) + "), ";
+    code += CastToBaseType(arraytype, "n") + ")\n";
+    code += "}\n\n";
+  }
+
   // Generate a struct field setter, conditioned on its child type(s).
   void GenStructMutator(const StructDef& struct_def, const FieldDef& field,
                         std::string* code_ptr) {
@@ -862,6 +1043,10 @@ class GoGenerator : public BaseGenerator {
         MutateScalarFieldOfStruct(struct_def, field, code_ptr);
       } else {
         MutateScalarFieldOfTable(struct_def, field, code_ptr);
+      }
+    } else if (IsArray(field.value.type)) {
+      if (IsScalar(field.value.type.element)) {
+        MutateElementOfArrayOfNonStruct(struct_def, field, code_ptr);
       }
     } else if (IsVector(field.value.type)) {
       if (IsScalar(field.value.type.element)) {
@@ -1317,25 +1502,129 @@ class GoGenerator : public BaseGenerator {
     code += "func (t *" + NativeName(struct_def) +
             ") Pack(builder *flatbuffers.Builder) flatbuffers.UOffsetT {\n";
     code += "\tif t == nil {\n\t\treturn 0\n\t}\n";
-    code += "\treturn Create" + namer_.Type(struct_def) + "(builder";
-    StructPackArgs(struct_def, "", code_ptr);
-    code += ")\n";
+    std::vector<FieldPathSegment> field_path;
+    if (StructPackNeedsDecls(struct_def, &field_path)) {
+      field_path.clear();
+      StructPackDecls(struct_def, &field_path, code_ptr);
+      code += "\treturn Create" + namer_.Type(struct_def) + "(\n";
+      code += "\t\tbuilder";
+      field_path.clear();
+      StructPackArgs(struct_def, &field_path, code_ptr);
+      code += ",\n\t)\n";
+    } else {
+      code += "\treturn Create" + namer_.Type(struct_def) + "(builder";
+      field_path.clear();
+      StructPackArgsInline(struct_def, &field_path, code_ptr);
+      code += ")\n";
+    }
     code += "}\n";
   }
 
-  void StructPackArgs(const StructDef& struct_def, const char* nameprefix,
+  bool StructPackNeedsDecls(const StructDef& struct_def,
+                            std::vector<FieldPathSegment>* path) {
+    for (auto it = struct_def.fields.vec.begin();
+         it != struct_def.fields.vec.end(); ++it) {
+      const FieldDef& field = **it;
+      const bool is_array = IsArray(field.value.type);
+      const auto& field_type =
+          is_array ? field.value.type.VectorType() : field.value.type;
+      path->push_back(
+          {field.name, is_array ? field.value.type.fixed_length : 0});
+      if (field_type.base_type == BASE_TYPE_STRUCT) {
+        if (StructPackNeedsDecls(*field_type.struct_def, path)) {
+          path->pop_back();
+          return true;
+        }
+      } else if (FieldPathHasArrayPrefix(*path)) {
+        path->pop_back();
+        return true;
+      }
+      path->pop_back();
+    }
+    return false;
+  }
+
+  void StructPackDecls(const StructDef& struct_def,
+                       std::vector<FieldPathSegment>* path,
+                       std::string* code_ptr) {
+    std::string& code = *code_ptr;
+    for (auto it = struct_def.fields.vec.begin();
+         it != struct_def.fields.vec.end(); ++it) {
+      const FieldDef& field = **it;
+      const bool is_array = IsArray(field.value.type);
+      const auto& field_type =
+          is_array ? field.value.type.VectorType() : field.value.type;
+      path->push_back(
+          {field.name, is_array ? field.value.type.fixed_length : 0});
+      if (field_type.base_type == BASE_TYPE_STRUCT) {
+        StructPackDecls(*field_type.struct_def, path, code_ptr);
+      } else if (FieldPathHasArrayPrefix(*path)) {
+        std::vector<std::string> array_indices;
+        const auto var_name = FieldPathName(*path);
+        code +=
+            "\tvar " + var_name + " " + FieldPathType(*path, field_type) + "\n";
+        for (size_t i = 0; i < path->size(); ++i) {
+          if ((*path)[i].length <= 0) continue;
+          const auto loop_var = "idx" + NumToString(array_indices.size());
+          code += Indent(array_indices.size() + 1) + "for " + loop_var +
+                  " := 0; " + loop_var + " < " +
+                  NumToString((*path)[i].length) + "; " + loop_var + "++ {\n";
+          array_indices.push_back(loop_var);
+        }
+        code += Indent(array_indices.size() + 1) +
+                FieldPathIndexedValue(*path, array_indices) + " = " +
+                NativeFieldPathIndexedValue("t", *path, array_indices) + "\n";
+        for (size_t i = array_indices.size(); i > 0; i--) {
+          code += Indent(i) + "}\n";
+        }
+      }
+      path->pop_back();
+    }
+  }
+
+  void StructPackArgsInline(const StructDef& struct_def,
+                            std::vector<FieldPathSegment>* path,
+                            std::string* code_ptr) {
+    std::string& code = *code_ptr;
+    for (auto it = struct_def.fields.vec.begin();
+         it != struct_def.fields.vec.end(); ++it) {
+      const FieldDef& field = **it;
+      const bool is_array = IsArray(field.value.type);
+      const auto& field_type =
+          is_array ? field.value.type.VectorType() : field.value.type;
+      path->push_back(
+          {field.name, is_array ? field.value.type.fixed_length : 0});
+      if (field_type.base_type == BASE_TYPE_STRUCT) {
+        StructPackArgsInline(*field_type.struct_def, path, code_ptr);
+      } else if (FieldPathHasArrayPrefix(*path)) {
+        code += ", " + FieldPathName(*path);
+      } else {
+        code += ", " + NativeFieldPath("t", *path);
+      }
+      path->pop_back();
+    }
+  }
+
+  void StructPackArgs(const StructDef& struct_def,
+                      std::vector<FieldPathSegment>* path,
                       std::string* code_ptr) {
     std::string& code = *code_ptr;
     for (auto it = struct_def.fields.vec.begin();
          it != struct_def.fields.vec.end(); ++it) {
       const FieldDef& field = **it;
-      if (field.value.type.base_type == BASE_TYPE_STRUCT) {
-        StructPackArgs(*field.value.type.struct_def,
-                       (nameprefix + namer_.Field(field) + ".").c_str(),
-                       code_ptr);
+      const bool is_array = IsArray(field.value.type);
+      const auto& field_type =
+          is_array ? field.value.type.VectorType() : field.value.type;
+      path->push_back(
+          {field.name, is_array ? field.value.type.fixed_length : 0});
+      if (field_type.base_type == BASE_TYPE_STRUCT) {
+        StructPackArgs(*field_type.struct_def, path, code_ptr);
+      } else if (FieldPathHasArrayPrefix(*path)) {
+        code += ",\n\t\t" + FieldPathName(*path);
       } else {
-        code += std::string(", t.") + nameprefix + namer_.Field(field);
+        code += ",\n\t\t" + NativeFieldPath("t", *path);
       }
+      path->pop_back();
     }
   }
 
@@ -1348,7 +1637,24 @@ class GoGenerator : public BaseGenerator {
     for (auto it = struct_def.fields.vec.begin();
          it != struct_def.fields.vec.end(); ++it) {
       const FieldDef& field = **it;
-      if (field.value.type.base_type == BASE_TYPE_STRUCT) {
+      if (IsArray(field.value.type)) {
+        auto arraytype = field.value.type.VectorType();
+        const std::string field_name = namer_.Field(field);
+        const std::string length = NumToString(field.value.type.fixed_length);
+        code += "\tfor j := 0; j < " + length + "; j++ {\n";
+        if (arraytype.base_type == BASE_TYPE_STRUCT) {
+          code += "\t\tx := " +
+                  WrapInNameSpaceAndTrack(field.value.type.struct_def,
+                                          field.value.type.struct_def->name) +
+                  "{}\n";
+          code += "\t\tt." + field_name + "[j] = *rcv." + namer_.Method(field) +
+                  "(&x, j).UnPack()\n";
+        } else {
+          code += "\t\tt." + field_name + "[j] = rcv." + namer_.Method(field) +
+                  "(j)\n";
+        }
+        code += "\t}\n";
+      } else if (field.value.type.base_type == BASE_TYPE_STRUCT) {
         code += "\tt." + namer_.Field(field) + " = rcv." +
                 namer_.Method(field) + "(nil).UnPack()\n";
       } else {
@@ -1408,6 +1714,8 @@ class GoGenerator : public BaseGenerator {
         return "rcv._tab.ByteVector";
       case BASE_TYPE_UNION:
         return "rcv._tab.Union";
+      case BASE_TYPE_ARRAY:
+        return GenGetter(type.VectorType());
       case BASE_TYPE_VECTOR:
         return GenGetter(type.VectorType());
       default:
@@ -1449,7 +1757,15 @@ class GoGenerator : public BaseGenerator {
     }
   }
 
+  std::string GenArrayType(const Type& type) {
+    return "[" + NumToString(type.fixed_length) + "]" +
+           GenTypeGet(type.VectorType());
+  }
+
   std::string GenTypeGet(const Type& type) {
+    if (IsArray(type)) {
+      return GenArrayType(type);
+    }
     if (type.enum_def != nullptr) {
       return GetEnumTypeName(*type.enum_def);
     }
@@ -1521,6 +1837,22 @@ class GoGenerator : public BaseGenerator {
     return namer_.ObjectType(enum_def);
   }
 
+  std::string NativeArrayElementType(const Type& type) {
+    if (IsScalar(type.base_type)) {
+      if (type.enum_def == nullptr) {
+        return GenTypeBasic(type);
+      } else {
+        return GetEnumTypeName(*type.enum_def);
+      }
+    } else if (type.base_type == BASE_TYPE_STRUCT) {
+      return WrapInNameSpaceAndTrack(type.struct_def,
+                                     NativeName(*type.struct_def));
+    }
+
+    FLATBUFFERS_ASSERT(0);
+    return std::string();
+  }
+
   std::string NativeType(const Type& type) {
     if (IsScalar(type.base_type)) {
       if (type.enum_def == nullptr) {
@@ -1530,6 +1862,9 @@ class GoGenerator : public BaseGenerator {
       }
     } else if (IsString(type)) {
       return "string";
+    } else if (IsArray(type)) {
+      return "[" + NumToString(type.fixed_length) + "]" +
+             NativeArrayElementType(type.VectorType());
     } else if (IsVector(type)) {
       return "[]" + NativeType(type.VectorType());
     } else if (type.base_type == BASE_TYPE_STRUCT) {
@@ -1546,10 +1881,13 @@ class GoGenerator : public BaseGenerator {
   // Create a struct with a builder and the struct's arguments.
   void GenStructBuilder(const StructDef& struct_def, std::string* code_ptr) {
     BeginBuilderArgs(struct_def, code_ptr);
-    StructBuilderArgs(struct_def, "", code_ptr);
+    std::vector<FieldPathSegment> field_path;
+    StructBuilderArgs(struct_def, &field_path, code_ptr);
     EndBuilderArgs(code_ptr);
 
-    StructBuilderBody(struct_def, "", code_ptr);
+    std::vector<std::string> array_indices;
+    field_path.clear();
+    StructBuilderBody(struct_def, &field_path, &array_indices, code_ptr);
     EndBuilderBody(code_ptr);
   }
 

@@ -20,7 +20,7 @@ go_path=${test_dir}/go_gen
 go_src=${go_path}/src
 
 # Emit Go code for the example schemas in the test dir:
-../flatc -g --gen-object-api -I include_test -o ${go_src} monster_test.fbs optional_scalars.fbs
+../flatc -g --gen-object-api -I include_test -o ${go_src} monster_test.fbs optional_scalars.fbs arrays_test.fbs
 ../flatc -g --gen-object-api -I include_test/sub -o ${go_src} include_test/order.fbs
 ../flatc -g --gen-object-api -o ${go_src}/Pizza include_test/sub/no_namespace.fbs
 ../flatc -g --gen-object-api -o ${go_src} required_strings.fbs
